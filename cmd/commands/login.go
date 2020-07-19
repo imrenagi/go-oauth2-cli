@@ -1,11 +1,17 @@
 package commands
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"runtime"
+	"time"
 
 	"github.com/coreos/go-oidc"
 	"github.com/spf13/cobra"
@@ -19,17 +25,25 @@ func NewLoginCmd() *cobra.Command {
 		a         app
 		sso       bool
 		issuerURL string
+		listen    string
 	)
 
 	loginCmd := cobra.Command{
 		Use:   "login",
 		Short: "use this for login",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 0 {
+				return errors.New("surplus arguments provided")
+			}
 
-			// u, err := url.Parse(a.redirectURI)
-			// if err != nil {
-			// 	return fmt.Errorf("parse redirect-uri: %v", err)
-			// }
+			u, err := url.Parse(a.redirectURI)
+			if err != nil {
+				return fmt.Errorf("parse redirect-uri: %v", err)
+			}
+			listenURL, err := url.Parse(listen)
+			if err != nil {
+				return fmt.Errorf("parse listen address: %v", err)
+			}
 
 			if a.client == nil {
 				a.client = http.DefaultClient
@@ -76,7 +90,25 @@ func NewLoginCmd() *cobra.Command {
 				return err
 			}
 
+			fmt.Printf("\n\t\t Open: %s\n\n", authURL)
+
 			err = openbrowser(authURL)
+			if err != nil {
+				return err
+			}
+
+			a.errChan = make(chan error)
+
+			http.HandleFunc(u.Path, a.handleCallback)
+			go func() {
+				log.Printf("listening on %s", listen)
+				err := http.ListenAndServe(listenURL.Host, nil)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}()
+
+			err = <-a.errChan
 			if err != nil {
 				return err
 			}
@@ -89,9 +121,10 @@ func NewLoginCmd() *cobra.Command {
 	loginCmd.Flags().StringVar(&a.clientID, "client-id", "example-app", "OAuth2 client ID of this application.")
 	loginCmd.Flags().StringVar(&a.clientSecret, "client-secret", "ZXhhbXBsZS1hcHAtc2VjcmV0", "OAuth2 client secret of this application.")
 	loginCmd.Flags().StringVar(&a.redirectURI, "redirect-uri", "http://127.0.0.1:8085/callback", "Callback URL for OAuth2 responses.")
+	loginCmd.Flags().StringArrayVar(&a.extraScopes, "scope", []string{}, "extra scopes for ouath2 url code request")
 	loginCmd.Flags().BoolVar(&a.offlineAccess, "offline-access", true, "If it is true, token for offline access will be granted")
 	loginCmd.Flags().StringVar(&issuerURL, "issuer", "http://127.0.0.1:5556/dex", "URL of the OpenID Connect issuer.")
-	loginCmd.Flags().StringArrayVar(&a.extraScopes, "scope", []string{}, "extra scopes for ouath2 url code request")
+	loginCmd.Flags().StringVar(&listen, "listen", "http://127.0.0.1:8085", "HTTP address to listen at.")
 
 	return &loginCmd
 }
@@ -131,6 +164,8 @@ type app struct {
 	offlineAccess  bool
 
 	client *http.Client
+
+	errChan chan error
 }
 
 func (a *app) oauth2Config(scopes []string) *oauth2.Config {
@@ -148,7 +183,7 @@ func (a *app) authCodeURL() (string, error) {
 	authCodeURL := ""
 	scopes := append(a.extraScopes, "openid", "profile", "email")
 
-	if a.offlineAccess {
+	if !a.offlineAccess {
 		authCodeURL = a.oauth2Config(scopes).AuthCodeURL(appState)
 	} else if a.offlineAsScope {
 		scopes = append(scopes, "offline_access")
@@ -158,4 +193,104 @@ func (a *app) authCodeURL() (string, error) {
 	}
 
 	return authCodeURL, nil
+}
+
+func (a *app) handleCallback(w http.ResponseWriter, r *http.Request) {
+	var (
+		err   error
+		token *oauth2.Token
+	)
+
+	ctx := oidc.ClientContext(r.Context(), a.client)
+	oauth2Config := a.oauth2Config(nil)
+	switch r.Method {
+	case http.MethodGet:
+		// Authorization redirect callback from OAuth2 auth flow.
+		if errMsg := r.FormValue("error"); errMsg != "" {
+			http.Error(w, errMsg+": "+r.FormValue("error_description"), http.StatusBadRequest)
+			a.errChan <- fmt.Errorf(r.FormValue("error_description"))
+			return
+		}
+		code := r.FormValue("code")
+		if code == "" {
+			http.Error(w, fmt.Sprintf("no code in request: %q", r.Form), http.StatusBadRequest)
+			a.errChan <- fmt.Errorf("no code in request: %q", r.Form)
+			return
+		}
+
+		if state := r.FormValue("state"); state != appState {
+			http.Error(w, fmt.Sprintf("expected state %q got %q", appState, state), http.StatusBadRequest)
+			a.errChan <- fmt.Errorf("expected state %q got %q", appState, state)
+			return
+		}
+		token, err = oauth2Config.Exchange(ctx, code)
+	case http.MethodPost:
+		// Form request from frontend to refresh a token.
+		refresh := r.FormValue("refresh_token")
+		if refresh == "" {
+			http.Error(w, fmt.Sprintf("no refresh_token in request: %q", r.Form), http.StatusBadRequest)
+			a.errChan <- fmt.Errorf("no refresh_token in request: %q", r.Form)
+			return
+		}
+		t := &oauth2.Token{
+			RefreshToken: refresh,
+			Expiry:       time.Now().Add(-time.Hour),
+		}
+		token, err = oauth2Config.TokenSource(ctx, t).Token()
+	default:
+		http.Error(w, fmt.Sprintf("method not implemented: %s", r.Method), http.StatusBadRequest)
+		a.errChan <- fmt.Errorf("method not implemented: %s", r.Method)
+		return
+	}
+
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get token: %v", err), http.StatusInternalServerError)
+		a.errChan <- fmt.Errorf("failed to get token: %v", err)
+		return
+	}
+
+	rawIDToken, ok := token.Extra("id_token").(string)
+	if !ok {
+		http.Error(w, "no id_token in token response", http.StatusInternalServerError)
+		a.errChan <- fmt.Errorf("no id_token in token response")
+		return
+	}
+
+	idToken, err := a.verifier.Verify(r.Context(), rawIDToken)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to verify ID token: %v", err), http.StatusInternalServerError)
+		a.errChan <- fmt.Errorf("failed to verify ID token: %v", err)
+		return
+	}
+
+	accessToken, ok := token.Extra("access_token").(string)
+	if !ok {
+		http.Error(w, "no access_token in token response", http.StatusInternalServerError)
+		a.errChan <- fmt.Errorf("no access_token in token response")
+		return
+	}
+
+	var claims json.RawMessage
+	if err := idToken.Claims(&claims); err != nil {
+		http.Error(w, fmt.Sprintf("error decoding ID token claims: %v", err), http.StatusInternalServerError)
+		a.errChan <- fmt.Errorf("error decoding ID token claims: %v", err)
+		return
+	}
+
+	buff := new(bytes.Buffer)
+	if err := json.Indent(buff, []byte(claims), "", "  "); err != nil {
+		http.Error(w, fmt.Sprintf("error indenting ID token claims: %v", err), http.StatusInternalServerError)
+		a.errChan <- fmt.Errorf("error indenting ID token claims: %v", err)
+		return
+	}
+
+	fmt.Printf("redirect_url: %s \n\n", a.redirectURI)
+	fmt.Printf("id_token: %s \n\n", rawIDToken)
+	fmt.Printf("access_token: %s \n\n", accessToken)
+	fmt.Printf("refresh_token: %s \n\n", token.RefreshToken)
+	fmt.Printf("claims: %s \n\n", buff.String())
+
+	renderToken(w, a.redirectURI, rawIDToken, accessToken, token.RefreshToken, buff.String())
+
+	a.errChan <- nil
 }
