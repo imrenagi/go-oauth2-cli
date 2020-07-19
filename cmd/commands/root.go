@@ -5,7 +5,7 @@ import (
 )
 
 var (
-	cliName = "sso-cli"
+	cliName = "authcli"
 )
 
 func init() {
@@ -20,9 +20,8 @@ func NewRootCommand(args []string) *cobra.Command {
 
 	var command = &cobra.Command{
 		Use:   cliName,
-		Short: "sso-cli is an application for demonstrating how to use oauth2 flow login in cli",
+		Short: "authcli is an application for demonstrating how to use oauth2 flow login in cli",
 		Run: func(c *cobra.Command, args []string) {
-
 			c.HelpFunc()(c, args)
 		},
 	}

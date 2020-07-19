@@ -90,7 +90,7 @@ func NewLoginCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("\n\t\t Open: %s\n\n", authURL)
+			fmt.Printf("\nOpen: %s\n\n", authURL)
 
 			err = openbrowser(authURL)
 			if err != nil {
