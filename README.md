@@ -3,6 +3,8 @@ GO-SSO-CLI
 
 You ever used tools which requires you to do login or authentication via termimnal like `gcloud auth login` or `argocd login` and wondering how to do oauth2 flow in cli or terminal? Here you go. I try to create a simple demo to demonstrate how Ouath2 can be done in terminal.
 
+![demo](./demo.gif)
+
 # Getting Started
 
 This is a sample of ouath client. Thus, you gonna need to have oauth2 server up and running prior running using this example. There are options available:
